@@ -101,8 +101,9 @@ def main():
             stats['meisai_proportional'] += 1
 
         # ケース3: 明細合計 < 目標合計 → 不足分を進行率で按分
+        # 完了現場は明細が確定しているとみなし、gap埋めをしない
         gap = (target_total or 0) - meisai_total
-        if gap > 1:  # 1円以上のギャップ
+        if gap > 1 and not is_completed:  # 1円以上のギャップ かつ 未完了現場のみ
             for y, m, ratio in progress_map:
                 amt = gap * ratio
                 label = 'その他原価(進行率按分)' if meisai_total > 0 else '進行管理変動費(按分)'
