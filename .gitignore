@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+streamlit.pid
+streamlit.log
+nohup.out
+start.sh
+stop.sh
+.streamlit/secrets.toml
