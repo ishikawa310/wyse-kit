@@ -23,10 +23,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.ticker
 from matplotlib.dates import MonthLocator, DateFormatter
-
-# macOS 日本語フォント設定
-matplotlib.rcParams['font.family'] = ['Hiragino Sans', 'Hiragino Maru Gothic Pro',
-                                       'AppleGothic', 'sans-serif']
+import japanize_matplotlib  # noqa: F401  Linux/Streamlit Cloud で日本語フォントを有効化
 
 # ===== 設定 =====
 st.set_page_config(
