@@ -100,6 +100,55 @@ def load_site_periods():
     conn.close()
     return df
 
+@st.cache_data(ttl=300)
+def load_cf_actual_balance():
+    """月初実残高テーブルをロード（なければ空DataFrame）"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cf_actual_balance (
+            ym           TEXT PRIMARY KEY,
+            actual_balance REAL,
+            memo         TEXT DEFAULT ''
+        )
+    """)
+    conn.commit()
+    df = pd.read_sql_query(
+        "SELECT ym, actual_balance, memo FROM cf_actual_balance ORDER BY ym", conn)
+    conn.close()
+    return df
+
+def save_cf_actual_balance(edited_df):
+    """編集済みDataFrameをwyse.dbに書き込み、GitHubにコミット"""
+    conn = sqlite3.connect(DB_PATH)
+    for _, row in edited_df.iterrows():
+        if row['実残高'] is not None and not pd.isna(row['実残高']):
+            conn.execute(
+                "INSERT OR REPLACE INTO cf_actual_balance (ym, actual_balance, memo) VALUES (?,?,?)",
+                (row['年月'], float(row['実残高']), row['メモ'] or ''))
+        else:
+            conn.execute("DELETE FROM cf_actual_balance WHERE ym=?", (row['年月'],))
+    conn.commit()
+    conn.close()
+    st.cache_data.clear()
+
+    github_ok = ("GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets)
+    if github_ok:
+        try:
+            from github import Github, GithubException
+            g    = Github(st.secrets["GITHUB_TOKEN"])
+            repo = g.get_repo(st.secrets["GITHUB_REPO"])
+            db_bytes = Path(DB_PATH).read_bytes()
+            now_str  = datetime.now().strftime("%Y-%m-%d %H:%M")
+            try:
+                cur = repo.get_contents("wyse.db")
+                repo.update_file("wyse.db", f"Update CF actual balance {now_str}", db_bytes, cur.sha)
+            except GithubException:
+                repo.create_file("wyse.db", f"Initial wyse.db {now_str}", db_bytes)
+            return True, "✅ 保存してGitHubに反映しました"
+        except Exception as e:
+            return True, f"⚠️ ローカルに保存しました（GitHub同期失敗: {e}）"
+    return True, "✅ 保存しました（GitHub未連携のためローカルのみ）"
+
 def fmt_ym(ym):
     """202402 → '2024年2月'"""
     if ym is None or pd.isna(ym):
@@ -557,7 +606,10 @@ elif page == "📅 CFカレンダー":
     sites = load_sites()
     costs = load_costs()
 
-    tab0, tab1, tab2, tab3 = st.tabs(["💹 月次CF比較", "💰 入金予定（明細）", "💸 支払予定（明細）", "📆 日次CF一覧"])
+    tab0, tab1, tab2, tab3, tab4 = st.tabs([
+        "💹 月次CF比較", "💰 入金予定（明細）", "💸 支払予定（明細）",
+        "📆 日次CF一覧", "💴 実残高対比",
+    ])
 
     # --- 月次CF集計データ作成 ---
     ar_all = sites[(sites['nyukin_yotei_date'] != '') & (sites['juchu_zeikomi'] > 0)].copy()
@@ -782,6 +834,112 @@ elif page == "📅 CFカレンダー":
                         '出金':     lambda v: f'¥{int(v):,}' if v > 0 else '-',
                         '累計残高': '¥{:,.0f}',
                     }),
+                use_container_width=True, hide_index=True
+            )
+
+    with tab4:
+        st.subheader("💴 実残高対比")
+        st.caption("月初の実際の銀行残高を入力して、予測累計CFとの乖離を把握します")
+
+        # 予測月次累計CF（cf は tab0 と共通で既に計算済み）
+        cf_proj = cf[['差引（純CF）']].copy()
+        cf_proj['予測累計CF'] = cf_proj['差引（純CF）'].cumsum()
+        proj_map = cf_proj['予測累計CF'].to_dict()   # ym → 予測累計CF
+
+        # 実残高をロード
+        actual_df = load_cf_actual_balance()
+        actual_map = {}
+        if not actual_df.empty:
+            actual_map = actual_df.set_index('ym')[['actual_balance', 'memo']].to_dict('index')
+
+        # 全月リストで編集用テーブルを作成
+        all_months = sorted(set(proj_map.keys()) | set(actual_map.keys()))
+        edit_rows = []
+        for ym in all_months:
+            edit_rows.append({
+                '年月':       ym,
+                '予測累計CF': proj_map.get(ym),
+                '実残高':     actual_map.get(ym, {}).get('actual_balance'),
+                'メモ':       actual_map.get(ym, {}).get('memo', ''),
+            })
+        edit_df = pd.DataFrame(edit_rows)
+        edit_df['乖離'] = edit_df['実残高'] - edit_df['予測累計CF']
+
+        st.markdown("##### 月初実残高の入力")
+        st.caption("「実残高」列に月初の銀行口座残高を直接入力し、「保存」を押してください。空欄のまま保存すると削除されます。")
+
+        edited = st.data_editor(
+            edit_df,
+            column_config={
+                '年月':       st.column_config.TextColumn('年月', disabled=True, width='small'),
+                '予測累計CF': st.column_config.NumberColumn('予測累計CF', format='¥%d', disabled=True),
+                '実残高':     st.column_config.NumberColumn('実残高（月初・手入力）', format='¥%d'),
+                'メモ':       st.column_config.TextColumn('メモ', width='medium'),
+                '乖離':       st.column_config.NumberColumn('乖離', format='¥%d', disabled=True),
+            },
+            hide_index=True,
+            use_container_width=True,
+            key='cf_actual_editor',
+        )
+
+        if st.button("💾 保存", type="primary", key="save_actual"):
+            ok, msg = save_cf_actual_balance(edited)
+            if '✅' in msg:
+                st.success(msg)
+            else:
+                st.warning(msg)
+
+        # グラフ & 乖離テーブル（実残高が1件以上入力済みの場合）
+        has_actual = edited['実残高'].notna().any()
+        if has_actual:
+            st.markdown("---")
+            st.subheader("📈 予測累計CF vs 実残高")
+
+            plot_df = edited.dropna(subset=['実残高']).copy()
+            all_xs   = list(range(len(edited)))
+            plot_xs  = [i for i, ym in enumerate(edited['年月']) if ym in plot_df['年月'].values]
+
+            fig, ax = plt.subplots(figsize=(12, 5))
+            # 予測ライン（全月）
+            ax.plot(all_xs, edited['予測累計CF'].values,
+                    color='#2e86c1', linewidth=2, marker='o', markersize=4,
+                    label='予測累計CF', zorder=4)
+            # 実残高ライン（入力済み月のみ）
+            ax.plot(plot_xs, plot_df['実残高'].values,
+                    color='#1a7a4a', linewidth=2, marker='s', markersize=6,
+                    linestyle='--', label='実残高', zorder=5)
+            # 乖離を塗りつぶし
+            if len(plot_xs) > 1:
+                ax.fill_between(
+                    plot_xs,
+                    edited['予測累計CF'].values[plot_xs[0]:plot_xs[-1]+1],
+                    plot_df['実残高'].values,
+                    alpha=0.15, color='#e67e22', label='乖離')
+
+            ax.axhline(0, color='grey', linewidth=0.8, linestyle=':')
+            ax.set_xticks(all_xs)
+            ax.set_xticklabels(edited['年月'], rotation=40, ha='right', fontsize=9)
+            ax.yaxis.set_major_formatter(
+                matplotlib.ticker.FuncFormatter(lambda v, _: f'¥{int(v):,}'))
+            ax.legend(fontsize=9)
+            ax.grid(axis='y', linestyle='--', alpha=0.4)
+            ax.set_title('予測累計CF vs 実残高（乖離＝実残高−予測）', fontsize=11)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+            # 乖離テーブル
+            gap_df = edited[edited['実残高'].notna()][
+                ['年月', '予測累計CF', '実残高', '乖離']].copy()
+            st.dataframe(
+                gap_df.style.format({
+                    '予測累計CF': '¥{:,.0f}', '実残高': '¥{:,.0f}', '乖離': '¥{:+,.0f}',
+                }).applymap(
+                    lambda v: 'color: #1a7a4a' if isinstance(v, (int, float)) and v > 0
+                              else 'color: #c0392b' if isinstance(v, (int, float)) and v < 0
+                              else '',
+                    subset=['乖離']
+                ),
                 use_container_width=True, hide_index=True
             )
 
