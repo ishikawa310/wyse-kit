@@ -871,20 +871,37 @@ elif page == "📤 データ更新":
             app_dir = Path(__file__).parent
             github_ok = ("GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets)
 
+            # ── ① 更新前スナップショット ──
+            pre_sites = pre_monthly = pre_alerts = None
+            if Path(DB_PATH).exists():
+                try:
+                    _c = sqlite3.connect(DB_PATH)
+                    pre_sites   = pd.read_sql_query(
+                        "SELECT genba_no, genba_name, juchu_zeikomi, is_completed FROM sites", _c)
+                    pre_monthly = pd.read_sql_query(
+                        "SELECT year||'/'||printf('%02d',month) AS ym,"
+                        " SUM(sales_amount_zeikomi) AS sales"
+                        " FROM sales_allocations GROUP BY ym", _c)
+                    pre_alerts  = pd.read_sql_query(
+                        "SELECT genba_no, kind, severity FROM alerts", _c)
+                    _c.close()
+                except Exception:
+                    pass
+
+            # ── ② パイプライン実行 ──
+            error_occurred = False
             with st.status("データを更新中...", expanded=True) as status:
 
-                # ① Excel保存
+                # Excel保存
                 st.write("📂 Excelファイルを保存中...")
                 excel_path = app_dir / "genba.xlsx"
                 excel_path.write_bytes(uploaded.getvalue())
 
-                # ② パイプライン実行
                 pipeline = [
                     ("extract.py",                   "📊 Excelからデータを抽出中..."),
                     ("allocate_costs.py",             "💰 原価配賦を計算中..."),
                     ("divergence_and_keiei_pl.py",    "📈 乖離アラートと経営管理PLを生成中..."),
                 ]
-                error_occurred = False
                 for script, label in pipeline:
                     st.write(label)
                     result = subprocess.run(
@@ -898,7 +915,7 @@ elif page == "📤 データ更新":
                         break
 
                 if not error_occurred:
-                    # ③ GitHubにコミット（Streamlit Cloud 用）
+                    # GitHubにコミット（Streamlit Cloud 用）
                     if github_ok:
                         st.write("☁️ GitHubにデータを保存中...")
                         try:
@@ -910,11 +927,7 @@ elif page == "📤 データ更新":
                             try:
                                 current = repo.get_contents("wyse.db")
                                 repo.update_file(
-                                    "wyse.db",
-                                    f"Update wyse.db {now_str}",
-                                    db_bytes,
-                                    current.sha,
-                                )
+                                    "wyse.db", f"Update wyse.db {now_str}", db_bytes, current.sha)
                             except GithubException:
                                 repo.create_file("wyse.db", f"Initial wyse.db {now_str}", db_bytes)
                             st.write("✅ GitHubに保存しました。Streamlit Cloudが自動再デプロイを開始します。")
@@ -928,6 +941,120 @@ elif page == "📤 データ更新":
                     # キャッシュクリア（現在のセッションに即反映）
                     st.cache_data.clear()
                     st.balloons()
+
+            # ── ③ 差分サマリ表示 ──
+            if not error_occurred and pre_sites is not None:
+                st.markdown("---")
+                st.subheader("📋 更新差分サマリ")
+                try:
+                    _c2 = sqlite3.connect(DB_PATH)
+                    post_sites   = pd.read_sql_query(
+                        "SELECT genba_no, genba_name, juchu_zeikomi, is_completed FROM sites", _c2)
+                    post_monthly = pd.read_sql_query(
+                        "SELECT year||'/'||printf('%02d',month) AS ym,"
+                        " SUM(sales_amount_zeikomi) AS sales"
+                        " FROM sales_allocations GROUP BY ym", _c2)
+                    post_alerts  = pd.read_sql_query(
+                        "SELECT genba_no, kind, severity FROM alerts", _c2)
+                    _c2.close()
+
+                    # 現場の増減
+                    pre_nos     = set(pre_sites['genba_no'])
+                    post_nos    = set(post_sites['genba_no'])
+                    added_nos   = post_nos - pre_nos
+                    removed_nos = pre_nos  - post_nos
+
+                    # 変更（受注金額 or 完了状態）
+                    merged_s = pre_sites.merge(post_sites, on='genba_no', suffixes=('_pre', '_post'))
+                    changed  = merged_s[
+                        (merged_s['juchu_zeikomi_pre'] != merged_s['juchu_zeikomi_post']) |
+                        (merged_s['is_completed_pre']  != merged_s['is_completed_post'])
+                    ]
+
+                    dc1, dc2, dc3 = st.columns(3)
+                    dc1.metric("🆕 新規現場", f"+{len(added_nos)}件")
+                    dc2.metric("🗑️ 削除現場", f"-{len(removed_nos)}件")
+                    dc3.metric("✏️ 変更あり",  f"{len(changed)}件")
+
+                    if added_nos:
+                        with st.expander(f"🆕 新規追加 ({len(added_nos)}件)"):
+                            df_add = post_sites[post_sites['genba_no'].isin(added_nos)][
+                                ['genba_no', 'genba_name', 'juchu_zeikomi']].copy()
+                            df_add.columns = ['現場No', '現場名', '受注金額(税込)']
+                            st.dataframe(df_add.style.format({'受注金額(税込)': '¥{:,.0f}'}),
+                                         hide_index=True, use_container_width=True)
+
+                    if removed_nos:
+                        with st.expander(f"🗑️ 削除 ({len(removed_nos)}件)"):
+                            df_rem = pre_sites[pre_sites['genba_no'].isin(removed_nos)][
+                                ['genba_no', 'genba_name']].copy()
+                            df_rem.columns = ['現場No', '現場名']
+                            st.dataframe(df_rem, hide_index=True, use_container_width=True)
+
+                    if not changed.empty:
+                        with st.expander(f"✏️ 変更あり ({len(changed)}件)"):
+                            rows = []
+                            for _, r in changed.iterrows():
+                                if r['juchu_zeikomi_pre'] != r['juchu_zeikomi_post']:
+                                    rows.append({
+                                        '現場No': r['genba_no'], '現場名': r['genba_name_post'],
+                                        '変更項目': '受注金額',
+                                        '変更前': f"¥{int(r['juchu_zeikomi_pre']):,}",
+                                        '変更後': f"¥{int(r['juchu_zeikomi_post']):,}",
+                                    })
+                                if r['is_completed_pre'] != r['is_completed_post']:
+                                    rows.append({
+                                        '現場No': r['genba_no'], '現場名': r['genba_name_post'],
+                                        '変更項目': '完了状態',
+                                        '変更前': '完了' if r['is_completed_pre'] else '未完了',
+                                        '変更後': '完了' if r['is_completed_post'] else '未完了',
+                                    })
+                            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+                    # 月次売上の変化
+                    pre_m  = pre_monthly.set_index('ym')['sales']
+                    post_m = post_monthly.set_index('ym')['sales']
+                    all_yms = pre_m.index.union(post_m.index)
+                    diff_m  = pd.DataFrame({
+                        '更新前': pre_m.reindex(all_yms, fill_value=0),
+                        '更新後': post_m.reindex(all_yms, fill_value=0),
+                    })
+                    diff_m['差分'] = diff_m['更新後'] - diff_m['更新前']
+                    diff_m_chg = diff_m[diff_m['差分'] != 0].sort_index()
+
+                    if not diff_m_chg.empty:
+                        with st.expander(f"📅 月次売上に変化あり ({len(diff_m_chg)}ヶ月)"):
+                            st.dataframe(
+                                diff_m_chg.style.format({
+                                    '更新前': '¥{:,.0f}', '更新後': '¥{:,.0f}',
+                                    '差分': '¥{:+,.0f}'}),
+                                use_container_width=True)
+                    else:
+                        st.success("✅ 月次売上データに変化はありませんでした。")
+
+                    # アラートの変化
+                    pre_a_set  = set(zip(pre_alerts['genba_no'],  pre_alerts['kind'],  pre_alerts['severity']))
+                    post_a_set = set(zip(post_alerts['genba_no'], post_alerts['kind'], post_alerts['severity']))
+                    new_alerts   = post_a_set - pre_a_set
+                    fixed_alerts = pre_a_set  - post_a_set
+                    if new_alerts or fixed_alerts:
+                        with st.expander(
+                                f"⚠️ アラート変化（新規 {len(new_alerts)}件 / 解消 {len(fixed_alerts)}件）"):
+                            if new_alerts:
+                                st.markdown("**🆕 新規アラート**")
+                                st.dataframe(
+                                    pd.DataFrame(list(new_alerts), columns=['現場No', 'カテゴリ', '重大度']),
+                                    hide_index=True, use_container_width=True)
+                            if fixed_alerts:
+                                st.markdown("**✅ 解消されたアラート**")
+                                st.dataframe(
+                                    pd.DataFrame(list(fixed_alerts), columns=['現場No', 'カテゴリ', '重大度']),
+                                    hide_index=True, use_container_width=True)
+                    else:
+                        st.success("✅ アラートに変化はありませんでした。")
+
+                except Exception as e:
+                    st.warning(f"差分表示でエラーが発生しました: {e}")
 
 # サイドバー: 補助情報
 with st.sidebar:
