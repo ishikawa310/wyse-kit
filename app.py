@@ -557,7 +557,7 @@ elif page == "📅 CFカレンダー":
     sites = load_sites()
     costs = load_costs()
 
-    tab0, tab1, tab2 = st.tabs(["💹 月次CF比較", "💰 入金予定（明細）", "💸 支払予定（明細）"])
+    tab0, tab1, tab2, tab3 = st.tabs(["💹 月次CF比較", "💰 入金予定（明細）", "💸 支払予定（明細）", "📆 日次CF一覧"])
 
     # --- 月次CF集計データ作成 ---
     ar_all = sites[(sites['nyukin_yotei_date'] != '') & (sites['juchu_zeikomi'] > 0)].copy()
@@ -689,6 +689,101 @@ elif page == "📅 CFカレンダー":
             use_container_width=True, hide_index=True
         )
         st.metric("支払予定合計", yen(ap['金額(税込)'].sum()))
+
+    with tab3:
+        st.subheader("📆 日次キャッシュフロー一覧")
+        st.caption("入金予定日・支払日を日付軸で統合し、累計残高を表示します")
+
+        # ── データ準備 ──
+        in_rows = sites[(sites['nyukin_yotei_date'] != '') & (sites['juchu_zeikomi'] > 0)].copy()
+        in_rows = in_rows[['nyukin_yotei_date', 'genba_no', 'genba_name', 'juchu_zeikomi']].copy()
+        in_rows.columns = ['日付', '現場No', '現場名', '金額']
+        in_rows['種別'] = '💰 入金予定'
+        in_rows['費目'] = ''
+        in_rows['取引先'] = ''
+        in_rows['入金'] = in_rows['金額']
+        in_rows['出金'] = 0.0
+
+        out_rows = costs[costs['shiharai_date'] != ''].copy()
+        out_rows = out_rows[['shiharai_date', 'genba_no', 'genba_name',
+                              'hi_moku', 'torihiki_saki', 'kingaku_zeikomi']].copy()
+        out_rows.columns = ['日付', '現場No', '現場名', '費目', '取引先', '金額']
+        out_rows['種別'] = '💸 支払予定'
+        out_rows['入金'] = 0.0
+        out_rows['出金'] = out_rows['金額']
+
+        COLS = ['日付', '種別', '現場No', '現場名', '費目', '取引先', '入金', '出金']
+        daily_all = pd.concat(
+            [in_rows[COLS], out_rows[COLS]], ignore_index=True
+        ).sort_values(['日付', '種別']).reset_index(drop=True)
+
+        if daily_all.empty:
+            st.info("表示するデータがありません。")
+        else:
+            # ── 期間フィルタ ──
+            avail_ym = sorted(daily_all['日付'].str[:7].unique())
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                from_ym = st.selectbox("表示開始月", avail_ym,
+                                        index=0, key="daily_from")
+            with fc2:
+                to_ym = st.selectbox("表示終了月", avail_ym,
+                                      index=len(avail_ym) - 1, key="daily_to")
+
+            mask = (daily_all['日付'].str[:7] >= from_ym) & \
+                   (daily_all['日付'].str[:7] <= to_ym)
+            daily = daily_all[mask].copy().reset_index(drop=True)
+
+            # ── 累計残高 ──
+            daily['差引'] = daily['入金'] - daily['出金']
+            daily['累計残高'] = daily['差引'].cumsum()
+
+            # ── KPI ──
+            k1, k2, k3 = st.columns(3)
+            k1.metric("入金合計", yen(daily['入金'].sum()))
+            k2.metric("出金合計", yen(daily['出金'].sum()))
+            net = daily['入金'].sum() - daily['出金'].sum()
+            k3.metric("差引", yen(net))
+
+            # ── 日別サマリ ──
+            with st.expander("📊 日別サマリ（同日の入出金を集計）"):
+                day_sum = daily.groupby('日付').agg(
+                    入金=('入金', 'sum'), 出金=('出金', 'sum')
+                ).reset_index()
+                day_sum['差引'] = day_sum['入金'] - day_sum['出金']
+                day_sum['累計残高'] = day_sum['差引'].cumsum()
+                st.dataframe(
+                    day_sum.style.format({
+                        '入金': lambda v: f'¥{int(v):,}' if v else '-',
+                        '出金': lambda v: f'¥{int(v):,}' if v else '-',
+                        '差引': '¥{:+,.0f}', '累計残高': '¥{:,.0f}',
+                    }).applymap(
+                        lambda v: 'color: #1a7a4a' if isinstance(v, (int, float)) and v > 0
+                                  else 'color: #c0392b' if isinstance(v, (int, float)) and v < 0
+                                  else '',
+                        subset=['差引', '累計残高']
+                    ),
+                    use_container_width=True, hide_index=True
+                )
+
+            # ── 明細テーブル ──
+            st.markdown("**明細一覧**")
+            disp = daily[['日付', '種別', '現場名', '費目', '取引先', '入金', '出金', '累計残高']].copy()
+
+            def _row_color(row):
+                bg = '#eaf4fb' if row['入金'] > 0 else '#fdf2f2'
+                return [f'background-color: {bg}'] * len(row)
+
+            st.dataframe(
+                disp.style
+                    .apply(_row_color, axis=1)
+                    .format({
+                        '入金':     lambda v: f'¥{int(v):,}' if v > 0 else '-',
+                        '出金':     lambda v: f'¥{int(v):,}' if v > 0 else '-',
+                        '累計残高': '¥{:,.0f}',
+                    }),
+                use_container_width=True, hide_index=True
+            )
 
 # ===== 工期ガントチャート =====
 elif page == "🗓️ 工期ガントチャート":
