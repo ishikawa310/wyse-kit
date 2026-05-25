@@ -634,6 +634,33 @@ elif page == "📅 CFカレンダー":
             if no_date.sum() > 0:
                 st.warning(f"⚠️ 入金予定日未入力 {no_date.sum()}件は集計に含まれていません。")
 
+                # 2026/01以降着工の未入力現場を一覧表示
+                _cy, _cm = map(int, ARCHIVE_CUTOFF_YM.split('/'))
+                _cutoff_int = _cy * 100 + _cm
+                _sp = load_site_periods()
+                _nd = sites[no_date].merge(
+                    _sp[['genba_no', 'first_ym', 'last_ym']], on='genba_no', how='left'
+                )
+                _nd_recent = _nd[
+                    _nd['first_ym'].notna() & (_nd['first_ym'] >= _cutoff_int)
+                ].copy()
+                if not _nd_recent.empty:
+                    st.markdown(f"**📋 {ARCHIVE_CUTOFF_YM}以降着工・入金予定日未入力 ({len(_nd_recent)}件)**")
+                    _nd_recent['着工予定月'] = _nd_recent['first_ym'].apply(fmt_ym)
+                    _nd_recent['完了予定月'] = _nd_recent['last_ym'].apply(fmt_ym)
+                    _nd_recent['種別'] = _nd_recent['sales_type'].map(
+                        {"motouke": "元請", "tsujou_kaitai": "通常/解体造成"})
+                    _nd_disp = _nd_recent[
+                        ['genba_no', 'genba_name', '種別', 'juchu_zeikomi', '着工予定月', '完了予定月']
+                    ].copy()
+                    _nd_disp.columns = ['現場No', '現場名', '種別', '請負金額(税込)', '着工予定月', '完了予定月']
+                    _nd_disp = _nd_disp.sort_values('着工予定月')
+                    st.dataframe(
+                        _nd_disp.style.format({'請負金額(税込)': '¥{:,.0f}'}),
+                        use_container_width=True, hide_index=True
+                    )
+                    st.caption(f"↑ 未集計の請負金額合計: {yen(_nd_disp['請負金額(税込)'].sum())}")
+
     with tab1:
         st.subheader("入金予定 明細 (現場シートB5「入金予定日」基準)")
         ar = sites[(sites['nyukin_yotei_date'] != '') & (sites['juchu_zeikomi'] > 0)].copy()
