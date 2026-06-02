@@ -43,13 +43,21 @@ def extract_number(val):
     return float(m.group()) if m else None
 
 def parse_date(val):
-    """セル値を日付に変換"""
+    """セル値を日付に変換（datetime/date型 + 文字列型に対応）"""
     if val is None or val == '':
         return None
     if isinstance(val, datetime):
         return val.date()
     if isinstance(val, date):
         return val
+    # 文字列の場合: "2026/09/30", "2026-09-30", "2026/9/30" などを解析
+    if isinstance(val, str):
+        val = val.strip()
+        for fmt in ('%Y/%m/%d', '%Y-%m-%d', '%Y/%m', '%m/%d/%Y'):
+            try:
+                return datetime.strptime(val, fmt).date()
+            except ValueError:
+                continue
     return None
 
 # ===== 進行管理シート抽出 =====
