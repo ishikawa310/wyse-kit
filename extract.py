@@ -5,12 +5,19 @@ v2: 現場シートB4「売上計上月」を売上計上の一次源とし、�
 """
 import re
 import sqlite3
+import unicodedata
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from openpyxl import load_workbook
 from parse_b4 import parse_uriage_tsuki
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
+
+_EXCEL_EPOCH = date(1899, 12, 30)  # Excelシリアル日付の起点
+
+def _norm(s):
+    """全角→半角・前後空白除去（シート名比較用）"""
+    return unicodedata.normalize('NFKC', str(s)).strip()
 
 # ===== 設定 =====
 BLUE_COLORS = {'FF4A86E8', 'FF6D9EEB', 'FF6FA8DC'}
@@ -43,21 +50,26 @@ def extract_number(val):
     return float(m.group()) if m else None
 
 def parse_date(val):
-    """セル値を日付に変換（datetime/date型 + 文字列型に対応）"""
+    """セル値を日付に変換（datetime/date/文字列/Excelシリアル値に対応）"""
     if val is None or val == '':
         return None
     if isinstance(val, datetime):
         return val.date()
     if isinstance(val, date):
         return val
-    # 文字列の場合: "2026/09/30", "2026-09-30", "2026/9/30" などを解析
+    # 文字列: "2026/09/30", "2026-09-30", "2026/9/30" など
     if isinstance(val, str):
-        val = val.strip()
         for fmt in ('%Y/%m/%d', '%Y-%m-%d', '%Y/%m', '%m/%d/%Y'):
             try:
-                return datetime.strptime(val, fmt).date()
+                return datetime.strptime(val.strip(), fmt).date()
             except ValueError:
                 continue
+    # 数値: openpyxlがExcelシリアル日付をfloat/intで返す場合
+    if isinstance(val, (int, float)):
+        try:
+            return _EXCEL_EPOCH + timedelta(days=int(val))
+        except (ValueError, OverflowError):
+            pass
     return None
 
 # ===== 進行管理シート抽出 =====
@@ -483,11 +495,17 @@ def main():
     all_sites = []
     alerts = []  # (genba_no, kind, severity, message, detail)
 
+    # シート名を正規化した逆引きマップ（全角→半角対応）
+    sheet_norm_map = {_norm(name): name for name in wb_data.sheetnames}
+
     # まず進行管理ベースの現場
     for s in sites_summary:
         sheet_name = s['genba_no']
-        if sheet_name in wb_data.sheetnames:
-            ws = wb_data[sheet_name]
+        actual_sheet = sheet_norm_map.get(_norm(sheet_name))  # 正規化マッチ
+        if actual_sheet is not None:
+            if actual_sheet != sheet_name:
+                print(f"  [シート名正規化] {repr(sheet_name)} → {repr(actual_sheet)}")
+            ws = wb_data[actual_sheet]
             template = identify_template(ws)
             detail = extract_site_sheet(ws, template)
             s.update(detail)
@@ -559,6 +577,7 @@ def main():
                                    'detail': ''})
             all_sites.append(s)
         else:
+            print(f"  [シートなし] genba_no={repr(sheet_name)} に対応するシートが見つかりません")
             s['template'] = 'NO_SHEET'
             s['costs'] = []
             s['b4_status'] = 'no_sheet'
