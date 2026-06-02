@@ -6,6 +6,7 @@ v2: 現場シートB4「売上計上月」を売上計上の一次源とし、�
 import re
 import sqlite3
 import unicodedata
+import calendar as _cal
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from openpyxl import load_workbook
@@ -468,6 +469,87 @@ def extract_site_sheet(ws, template):
     info['_sections'] = sections
     return info
 
+# ===== 入金予定シート抽出 =====
+def extract_nyukin_yotei(wb_data):
+    """「入金予定」シートから入金スケジュールを抽出。
+    列構成: A=現場No, B=現場名, C=請求種別, D=入金金額(税込), E=入金予定日
+    """
+    sheet_norm_map = {_norm(n): n for n in wb_data.sheetnames}
+    actual = sheet_norm_map.get(_norm('入金予定'))
+    if not actual:
+        print("  [入金予定シートなし] CFカレンダーは sites.nyukin_yotei_date を使用")
+        return []
+
+    ws = wb_data[actual]
+    _mon_abbr = {v.lower(): k for k, v in enumerate(_cal.month_abbr) if v}
+    payments = []
+
+    for r in range(2, ws.max_row + 1):
+        genba_no_val = ws.cell(row=r, column=1).value
+        if not genba_no_val:
+            continue
+        genba_no = _norm(str(genba_no_val))
+        if not genba_no or genba_no.lower() == 'none':
+            continue
+
+        genba_name   = ws.cell(row=r, column=2).value
+        seikyu_kubun = ws.cell(row=r, column=3).value
+        kingaku_val  = ws.cell(row=r, column=4).value
+        nyukin_val   = ws.cell(row=r, column=5).value
+
+        kingaku = extract_number(kingaku_val)
+        if not kingaku or kingaku <= 0:
+            continue
+
+        # 入金予定日の解析
+        nyukin_date = parse_date(nyukin_val)
+        nyukin_text = ''
+        is_collected = 0
+
+        if nyukin_date is None and nyukin_val is not None:
+            raw = str(nyukin_val).strip()
+            nyukin_text = raw
+            # 受領済・相殺フラグ
+            if any(kw in raw for kw in ('受領済', '入金済', '相殺', '済')):
+                is_collected = 1
+            # YYYY/MM/DD または YYYY-MM-DD を文字列中から抽出
+            m = re.search(r'(\d{4})[/\-年](\d{1,2})[/\-月](\d{1,2})', raw)
+            if m:
+                try:
+                    nyukin_date = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                except ValueError:
+                    pass
+            # "Jan-26", "Mar-26" 形式 (MMM-YY) → その月末
+            if nyukin_date is None:
+                mm = re.match(r'([A-Za-z]{3})[- ](\d{2})$', raw)
+                if mm:
+                    mon = _mon_abbr.get(mm.group(1).lower())
+                    if mon:
+                        yr  = 2000 + int(mm.group(2))
+                        nyukin_date = date(yr, mon, _cal.monthrange(yr, mon)[1])
+            # "3月末", "4月末" 形式 → 当年のその月末
+            if nyukin_date is None:
+                mm = re.match(r'(\d{1,2})月末', raw)
+                if mm:
+                    mon = int(mm.group(1))
+                    yr  = datetime.now().year
+                    nyukin_date = date(yr, mon, _cal.monthrange(yr, mon)[1])
+
+        payments.append({
+            'genba_no':          genba_no,
+            'genba_name':        str(genba_name).strip() if genba_name else '',
+            'seikyu_kubun':      str(seikyu_kubun).strip() if seikyu_kubun else '',
+            'kingaku_zeikomi':   kingaku,
+            'nyukin_yotei_date': str(nyukin_date) if nyukin_date else '',
+            'nyukin_yotei_text': nyukin_text,
+            'is_collected':      is_collected,
+        })
+
+    dated   = sum(1 for p in payments if p['nyukin_yotei_date'])
+    coll    = sum(1 for p in payments if p['is_collected'])
+    print(f"  入金予定シート: {len(payments)}件（日付確定{dated}件, 受領済{coll}件）")
+    return payments
+
 # ===== メイン =====
 def main():
     print("=" * 60)
@@ -667,13 +749,27 @@ def main():
     print(f"  抽出現場合計: {len(all_sites)}件")
     print(f"  検出アラート: {len(alerts)}件")
 
+    print("[3.5/5] 入金予定シート抽出中...")
+    payments = extract_nyukin_yotei(wb_data)
+
     print("[4/5] SQLite保存中...")
-    save_to_sqlite(all_sites, excluded, alerts)
+    save_to_sqlite(all_sites, excluded, alerts, payments)
 
     print("[5/5] 完了")
     return all_sites, excluded, alerts
 
-def save_to_sqlite(sites, excluded, alerts=None):
+def save_to_sqlite(sites, excluded, alerts=None, payments=None):
+    # cf_actual_balance（手入力残高）を退避してDB再作成後に復元
+    cf_actual_backup = []
+    if Path(DB_PATH).exists():
+        try:
+            _tmp = sqlite3.connect(DB_PATH)
+            cf_actual_backup = _tmp.execute(
+                "SELECT ym, actual_balance, memo FROM cf_actual_balance").fetchall()
+            _tmp.close()
+        except Exception:
+            pass
+
     Path(DB_PATH).unlink(missing_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -721,6 +817,19 @@ def save_to_sqlite(sites, excluded, alerts=None):
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         genba_no TEXT, kind TEXT, severity TEXT, message TEXT, detail TEXT
     )""")
+    c.execute("""CREATE TABLE site_payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        genba_no TEXT, genba_name TEXT, seikyu_kubun TEXT,
+        kingaku_zeikomi REAL,
+        nyukin_yotei_date TEXT,
+        nyukin_yotei_text TEXT,
+        is_collected INTEGER DEFAULT 0
+    )""")
+    c.execute("""CREATE TABLE cf_actual_balance (
+        ym TEXT PRIMARY KEY, actual_balance REAL, memo TEXT DEFAULT ''
+    )""")
+    for row in cf_actual_backup:
+        c.execute("INSERT OR REPLACE INTO cf_actual_balance VALUES (?,?,?)", row)
 
     for s in sites:
         # 完了判定: 進行管理優先、なければ現場シートの施工状況
@@ -782,12 +891,21 @@ def save_to_sqlite(sites, excluded, alerts=None):
         c.execute("INSERT INTO alerts (genba_no, kind, severity, message, detail) VALUES (?,?,?,?,?)",
                   (a['genba_no'], a['kind'], a['severity'], a['message'], a.get('detail', '')))
 
+    for p in (payments or []):
+        c.execute("""INSERT INTO site_payments
+                     (genba_no, genba_name, seikyu_kubun, kingaku_zeikomi,
+                      nyukin_yotei_date, nyukin_yotei_text, is_collected)
+                     VALUES (?,?,?,?,?,?,?)""",
+                  (p['genba_no'], p['genba_name'], p['seikyu_kubun'],
+                   p['kingaku_zeikomi'], p['nyukin_yotei_date'],
+                   p['nyukin_yotei_text'], p['is_collected']))
+
     conn.commit()
 
     print(f"  sites: {c.execute('SELECT COUNT(*) FROM sites').fetchone()[0]}件")
     print(f"  sales_allocations: {c.execute('SELECT COUNT(*) FROM sales_allocations').fetchone()[0]}件")
-    print(f"  sales_allocations_shinkou: {c.execute('SELECT COUNT(*) FROM sales_allocations_shinkou').fetchone()[0]}件")
     print(f"  costs: {c.execute('SELECT COUNT(*) FROM costs').fetchone()[0]}件")
+    print(f"  site_payments: {c.execute('SELECT COUNT(*) FROM site_payments').fetchone()[0]}件")
     print(f"  alerts: {c.execute('SELECT COUNT(*) FROM alerts').fetchone()[0]}件")
     conn.close()
 

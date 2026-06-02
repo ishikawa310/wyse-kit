@@ -101,6 +101,20 @@ def load_site_periods():
     return df
 
 @st.cache_data(ttl=300)
+def load_site_payments():
+    """入金予定シートから抽出した入金スケジュールをロード"""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(
+            "SELECT * FROM site_payments ORDER BY nyukin_yotei_date, genba_no", conn)
+    except Exception:
+        df = pd.DataFrame(columns=[
+            'id','genba_no','genba_name','seikyu_kubun',
+            'kingaku_zeikomi','nyukin_yotei_date','nyukin_yotei_text','is_collected'])
+    conn.close()
+    return df
+
+@st.cache_data(ttl=300)
 def load_cf_actual_balance():
     """月初実残高テーブルをロード（なければ空DataFrame）"""
     conn = sqlite3.connect(DB_PATH)
@@ -603,8 +617,9 @@ elif page == "📈 月次PL":
 # ===== CFカレンダー =====
 elif page == "📅 CFカレンダー":
     st.title("📅 キャッシュフローカレンダー")
-    sites = load_sites()
-    costs = load_costs()
+    sites    = load_sites()
+    costs    = load_costs()
+    payments = load_site_payments()
 
     tab0, tab1, tab2, tab3, tab4 = st.tabs([
         "💹 月次CF比較", "💰 入金予定（明細）", "💸 支払予定（明細）",
@@ -612,9 +627,14 @@ elif page == "📅 CFカレンダー":
     ])
 
     # --- 月次CF集計データ作成 ---
-    ar_all = sites[(sites['nyukin_yotei_date'] != '') & (sites['juchu_zeikomi'] > 0)].copy()
-    ar_all['ym'] = ar_all['nyukin_yotei_date'].str[:7].str.replace('-', '/')
-    m_in = ar_all.groupby('ym')['juchu_zeikomi'].sum().rename('入金予定')
+    # 入金: 入金予定シート（日付確定 & 未受領のみ集計）
+    _pmt_dated = payments[
+        (payments['nyukin_yotei_date'] != '') &
+        (payments['kingaku_zeikomi'] > 0) &
+        (payments['is_collected'] == 0)
+    ].copy()
+    _pmt_dated['ym'] = _pmt_dated['nyukin_yotei_date'].str[:7].str.replace('-', '/')
+    m_in = _pmt_dated.groupby('ym')['kingaku_zeikomi'].sum().rename('入金予定')
 
     ap_all = costs[costs['shiharai_date'] != ''].copy()
     ap_all['ym'] = ap_all['shiharai_date'].str[:7].str.replace('-', '/')
@@ -682,53 +702,52 @@ elif page == "📅 CFカレンダー":
                 use_container_width=True
             )
 
-            no_date = (sites['nyukin_yotei_date'] == '') & (sites['juchu_zeikomi'] > 0)
-            if no_date.sum() > 0:
-                st.warning(f"⚠️ 入金予定日未入力 {no_date.sum()}件は集計に含まれていません。")
-
-                # 2026/01以降着工の未入力現場を一覧表示
-                _cy, _cm = map(int, ARCHIVE_CUTOFF_YM.split('/'))
-                _cutoff_int = _cy * 100 + _cm
-                _sp = load_site_periods()
-                _nd = sites[no_date].merge(
-                    _sp[['genba_no', 'first_ym', 'last_ym']], on='genba_no', how='left'
+            # 入金予定シートに登録済みだが日付未確定のもの
+            _nd_pmt = payments[
+                (payments['nyukin_yotei_date'] == '') &
+                (payments['kingaku_zeikomi'] > 0) &
+                (payments['is_collected'] == 0)
+            ]
+            if not _nd_pmt.empty:
+                st.warning(f"⚠️ 入金予定日未確定 {len(_nd_pmt)}件は集計に含まれていません。")
+                _nd_disp = _nd_pmt[['genba_no','genba_name','seikyu_kubun','kingaku_zeikomi','nyukin_yotei_text']].copy()
+                _nd_disp.columns = ['現場No','現場名','請求種別','入金金額(税込)','日付メモ']
+                st.dataframe(
+                    _nd_disp.style.format({'入金金額(税込)': '¥{:,.0f}'}),
+                    use_container_width=True, hide_index=True
                 )
-                _nd_recent = _nd[
-                    _nd['first_ym'].notna() & (_nd['first_ym'] >= _cutoff_int)
-                ].copy()
-                if not _nd_recent.empty:
-                    st.markdown(f"**📋 {ARCHIVE_CUTOFF_YM}以降着工・入金予定日未入力 ({len(_nd_recent)}件)**")
-                    _nd_recent['着工予定月'] = _nd_recent['first_ym'].apply(fmt_ym)
-                    _nd_recent['完了予定月'] = _nd_recent['last_ym'].apply(fmt_ym)
-                    _nd_recent['種別'] = _nd_recent['sales_type'].map(
-                        {"motouke": "元請", "tsujou_kaitai": "通常/解体造成"})
-                    _nd_disp = _nd_recent[
-                        ['genba_no', 'genba_name', '種別', 'juchu_zeikomi', '着工予定月', '完了予定月']
-                    ].copy()
-                    _nd_disp.columns = ['現場No', '現場名', '種別', '請負金額(税込)', '着工予定月', '完了予定月']
-                    _nd_disp = _nd_disp.sort_values('着工予定月')
-                    st.dataframe(
-                        _nd_disp.style.format({'請負金額(税込)': '¥{:,.0f}'}),
-                        use_container_width=True, hide_index=True
-                    )
-                    st.caption(f"↑ 未集計の請負金額合計: {yen(_nd_disp['請負金額(税込)'].sum())}")
+                st.caption(f"↑ 未集計の入金合計: {yen(_nd_pmt['kingaku_zeikomi'].sum())}")
 
     with tab1:
-        st.subheader("入金予定 明細 (現場シートB5「入金予定日」基準)")
-        ar = sites[(sites['nyukin_yotei_date'] != '') & (sites['juchu_zeikomi'] > 0)].copy()
-        ar = ar[['nyukin_yotei_date', 'genba_no', 'genba_name', 'sales_type', 'juchu_zeikomi']].copy()
-        ar['sales_type'] = ar['sales_type'].map({"motouke":"元請","tsujou_kaitai":"通常/解体造成"})
-        ar.columns = ['入金予定日', '現場No', '現場名', '種別', '金額(税込)']
-        ar = ar.sort_values('入金予定日')
-        st.dataframe(
-            ar.style.format({'金額(税込)': '¥{:,.0f}'}),
-            use_container_width=True, hide_index=True
-        )
-        st.metric("入金予定合計", yen(ar['金額(税込)'].sum()))
+        st.subheader("💰 入金予定 明細（入金予定シート基準）")
+        if payments.empty:
+            st.info("入金予定シートにデータがありません。genba.xlsx に「入金予定」シートを追加してください。")
+        else:
+            ar = payments.copy()
+            ar['受領済'] = ar['is_collected'].map({0: '', 1: '✅ 受領済'})
+            ar_disp = ar[['nyukin_yotei_date','nyukin_yotei_text','genba_no','genba_name',
+                           'seikyu_kubun','kingaku_zeikomi','受領済']].copy()
+            ar_disp.columns = ['入金予定日','日付メモ','現場No','現場名','請求種別','入金金額(税込)','受領済']
+            ar_disp = ar_disp.sort_values(['入金予定日','現場No'])
 
-        no_date = (sites['nyukin_yotei_date'] == '') & (sites['juchu_zeikomi'] > 0)
-        if no_date.sum() > 0:
-            st.warning(f"⚠️ 入金予定日未入力: {no_date.sum()}件 (現場シートB5の入力を確認してください)")
+            def _color_row(row):
+                if row['受領済']:
+                    return ['color: #888888'] * len(row)
+                if not row['入金予定日']:
+                    return ['background-color: #fff2cc'] * len(row)
+                return [''] * len(row)
+
+            st.dataframe(
+                ar_disp.style.apply(_color_row, axis=1)
+                             .format({'入金金額(税込)': '¥{:,.0f}'}),
+                use_container_width=True, hide_index=True
+            )
+            c1, c2, c3 = st.columns(3)
+            c1.metric("日付確定の入金合計", yen(
+                payments[(payments['nyukin_yotei_date'] != '') & (payments['is_collected']==0)]['kingaku_zeikomi'].sum()))
+            c2.metric("受領済合計", yen(
+                payments[payments['is_collected']==1]['kingaku_zeikomi'].sum()))
+            c3.metric("入金予定シート合計", yen(payments['kingaku_zeikomi'].sum()))
 
     with tab2:
         st.subheader("支払予定 明細 (原価明細「支払日」基準)")
@@ -747,11 +766,14 @@ elif page == "📅 CFカレンダー":
         st.caption("入金予定日・支払日を日付軸で統合し、累計残高を表示します")
 
         # ── データ準備 ──
-        in_rows = sites[(sites['nyukin_yotei_date'] != '') & (sites['juchu_zeikomi'] > 0)].copy()
-        in_rows = in_rows[['nyukin_yotei_date', 'genba_no', 'genba_name', 'juchu_zeikomi']].copy()
-        in_rows.columns = ['日付', '現場No', '現場名', '金額']
+        _pmt_daily = payments[
+            (payments['nyukin_yotei_date'] != '') &
+            (payments['kingaku_zeikomi'] > 0) &
+            (payments['is_collected'] == 0)
+        ].copy()
+        in_rows = _pmt_daily[['nyukin_yotei_date','genba_no','genba_name','seikyu_kubun','kingaku_zeikomi']].copy()
+        in_rows.columns = ['日付', '現場No', '現場名', '費目', '金額']
         in_rows['種別'] = '💰 入金予定'
-        in_rows['費目'] = ''
         in_rows['取引先'] = ''
         in_rows['入金'] = in_rows['金額']
         in_rows['出金'] = 0.0
