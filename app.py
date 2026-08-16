@@ -488,7 +488,7 @@ elif page == "📈 月次PL":
     HI_MOKU_ORDER = ['労務費', '処分費', '外注費', '機材レンタル', 'アスベスト',
                      '下請外注', '進行管理変動費(按分)', 'その他原価(進行率按分)', '明細(日付なし)']
 
-    def render_cost_breakdown(costs_df):
+    def render_cost_breakdown(costs_df, tab_key=''):
         """費目別月次原価内訳（スタックバー＋テーブル）"""
         if costs_df.empty:
             return
@@ -546,7 +546,7 @@ elif page == "📈 月次PL":
                 if not ym_options:
                     st.info("該当月はありません。")
                 else:
-                    sel_ym = st.selectbox("月を選択", ym_options, key=f"meisai_nd_ym_{id(costs_df)}")
+                    sel_ym = st.selectbox("月を選択", ym_options, key=f"meisai_nd_ym_{tab_key}")
                     sel_year, sel_month = map(int, sel_ym.split('/'))
                     ca = load_cost_allocations('kaikei')
                     detail = ca[
@@ -625,7 +625,7 @@ elif page == "📈 月次PL":
         st.bar_chart(df[['元請', '通常解造']])
         st.subheader("月次粗利率推移")
         st.line_chart(df[['会計粗利率', '経管粗利率']])
-        render_cost_breakdown(costs_df)
+        render_cost_breakdown(costs_df, tab_key)
 
     tab_normal, tab_archive = st.tabs([
         f"📊 通常（{ARCHIVE_CUTOFF_YM}〜）",
