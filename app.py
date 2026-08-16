@@ -276,10 +276,13 @@ if page == "📊 概要":
         '経管原価': m_kk,
     }).fillna(0)
     df_pl = df_pl[df_pl.index >= ARCHIVE_CUTOFF_YM].tail(3)
-    df_pl['会計粗利率'] = (df_pl['売上(税込)']/1.1 - df_pl['会計原価']) / (df_pl['売上(税込)']/1.1)
-    df_pl['経管粗利率'] = (df_pl['売上(税込)']/1.1 - df_pl['経管原価']) / (df_pl['売上(税込)']/1.1)
+    df_pl['会計粗利'] = df_pl['売上(税込)']/1.1 - df_pl['会計原価']
+    df_pl['経管粗利'] = df_pl['売上(税込)']/1.1 - df_pl['経管原価']
+    df_pl['会計粗利率'] = df_pl['会計粗利'] / (df_pl['売上(税込)']/1.1)
+    df_pl['経管粗利率'] = df_pl['経管粗利'] / (df_pl['売上(税込)']/1.1)
     st.dataframe(df_pl.style.format({
         '売上(税込)': '¥{:,.0f}', '会計原価': '¥{:,.0f}', '経管原価': '¥{:,.0f}',
+        '会計粗利': '¥{:,.0f}', '経管粗利': '¥{:,.0f}',
         '会計粗利率': '{:.1%}', '経管粗利率': '{:.1%}',
     }), use_container_width=True)
 
@@ -467,8 +470,10 @@ elif page == "📈 月次PL":
         '元請': m_mt, '通常解造': m_ts, '売上計': m_s,
         '会計原価': m_k, '経管原価': m_kk,
     }).fillna(0).sort_index()
-    df_all['会計粗利率'] = (df_all['売上計']/1.1 - df_all['会計原価']) / (df_all['売上計']/1.1)
-    df_all['経管粗利率'] = (df_all['売上計']/1.1 - df_all['経管原価']) / (df_all['売上計']/1.1)
+    df_all['会計粗利'] = df_all['売上計']/1.1 - df_all['会計原価']
+    df_all['経管粗利'] = df_all['売上計']/1.1 - df_all['経管原価']
+    df_all['会計粗利率'] = df_all['会計粗利'] / (df_all['売上計']/1.1)
+    df_all['経管粗利率'] = df_all['経管粗利'] / (df_all['売上計']/1.1)
     df_all['粗利率差異'] = df_all['経管粗利率'] - df_all['会計粗利率']
 
     df_normal = df_all[df_all.index >= ARCHIVE_CUTOFF_YM]
@@ -477,6 +482,7 @@ elif page == "📈 月次PL":
     PL_FORMAT = {
         '元請': '¥{:,.0f}', '通常解造': '¥{:,.0f}', '売上計': '¥{:,.0f}',
         '会計原価': '¥{:,.0f}', '経管原価': '¥{:,.0f}',
+        '会計粗利': '¥{:,.0f}', '経管粗利': '¥{:,.0f}',
         '会計粗利率': '{:.1%}', '経管粗利率': '{:.1%}', '粗利率差異': '{:+.1%}',
     }
 
@@ -623,6 +629,8 @@ elif page == "📈 月次PL":
         st.markdown("---")
         st.subheader("月次売上推移グラフ")
         st.bar_chart(df[['元請', '通常解造']])
+        st.subheader("月次粗利額推移")
+        st.bar_chart(df[['会計粗利', '経管粗利']])
         st.subheader("月次粗利率推移")
         st.line_chart(df[['会計粗利率', '経管粗利率']])
         render_cost_breakdown(costs_df, tab_key)
