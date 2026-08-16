@@ -7,6 +7,8 @@
 """
 import sqlite3
 
+from allocate_costs import family_key, build_family_progress
+
 DB_PATH = 'wyse.db'
 
 def detect_divergence_alerts():
@@ -146,6 +148,7 @@ def build_keiei_pl():
     )""")
 
     n_inserted = 0
+    family_progress = build_family_progress(c)
     sites_rows = c.execute("""
         SELECT s.genba_no, s.sales_type, s.is_completed,
                s.juchu_zeinuki, s.shitauke_zeibetsu,
@@ -165,20 +168,11 @@ def build_keiei_pl():
         if adopted_cost == 0:
             continue
 
-        # この現場の月別売上合計
-        alloc = c.execute("""SELECT year, month, sales_amount_zeikomi
-                             FROM sales_allocations WHERE genba_no=?
-                             AND sales_amount_zeikomi > 0
-                             ORDER BY year, month""", (no,)).fetchall()
-        if not alloc:
+        # 進行率で按分（枝番ファミリー全体の売上比率を使用）
+        progress = family_progress.get(family_key(no))
+        if not progress:
             continue
-        total_sales = sum(a[2] for a in alloc)
-        if total_sales == 0:
-            continue
-
-        # 進行率で按分
-        for y, m, amt in alloc:
-            ratio = amt / total_sales
+        for y, m, ratio in progress:
             cost_for_month = adopted_cost * ratio
             c.execute("INSERT INTO cost_allocations_keiei VALUES (?,?,?,?,?)",
                       (no, y, m, cost_for_month, '採用原価_進行率按分'))

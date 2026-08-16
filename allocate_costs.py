@@ -3,11 +3,39 @@
 - 完了現場 → 実原価ベース
 - 未完了現場 → 予定原価ベース
 - 明細にhassei_dateがあれば発生月へ計上、なければ進行率で按分
+- 進行率は枝番ファミリー(例: 2571 / 2571-2 / 2571-3)の売上を合算して算出
 """
 import sqlite3
 from datetime import datetime
 
 DB_PATH = 'wyse.db'
+
+def family_key(genba_no):
+    """枝番現場の親キー（'-'より前）を返す。枝番なしはそのまま。"""
+    return str(genba_no).split('-')[0]
+
+def build_family_progress(c):
+    """枝番ファミリー単位の月別売上進行率を返す。
+    1つの工事を中間金・完了金などでシート分割した場合でも、
+    工事全体の売上計上月比率で原価を按分するため。
+    返り値: {family_key: [(year, month, ratio), ...]}
+    """
+    rows = c.execute("""
+        SELECT genba_no, year, month, SUM(sales_amount_zeikomi)
+        FROM sales_allocations GROUP BY genba_no, year, month
+    """).fetchall()
+    fam_months = {}
+    for no, y, m, amt in rows:
+        key = family_key(no)
+        fam_months.setdefault(key, {})
+        fam_months[key][(y, m)] = fam_months[key].get((y, m), 0) + (amt or 0)
+    result = {}
+    for key, months in fam_months.items():
+        total = sum(months.values())
+        if total > 0:
+            result[key] = [(y, m, v / total)
+                           for (y, m), v in sorted(months.items())]
+    return result
 
 def main():
     conn = sqlite3.connect(DB_PATH)
@@ -33,23 +61,16 @@ def main():
     stats = {'meisai_proportional': 0, 'mochinashi_shinkou': 0,
              'meisai_only': 0, 'all_proportional': 0, 'skip': 0}
 
+    family_progress = build_family_progress(c)
+
     for row in sites_rows:
         no, sales_type, is_completed, template, ge_y, ge_j, hendou, shitauke, juchu = row
 
-        # 月別進行率(sales_allocations)を取得
-        alloc_rows = c.execute(
-            "SELECT year, month, sales_amount_zeikomi FROM sales_allocations WHERE genba_no=? ORDER BY year, month",
-            (no,)).fetchall()
-        if not alloc_rows:
+        # 月別進行率: 枝番ファミリー全体の売上比率を使用
+        progress_map = family_progress.get(family_key(no))
+        if not progress_map:
             stats['skip'] += 1
             continue
-        total_sales = sum(a[2] for a in alloc_rows)
-        if total_sales == 0:
-            stats['skip'] += 1
-            continue
-
-        # 月別の進行率(=その月の売上 / 全月売上合計)
-        progress_map = [(y, m, amt / total_sales) for y, m, amt in alloc_rows]
 
         # 使用する原価ベースを決定
         # 通常/解体造成: 原価合計(労務費+機材+処分+外注+仕入+燃料)
