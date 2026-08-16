@@ -539,6 +539,29 @@ elif page == "📈 月次PL":
                 use_container_width=True
             )
 
+        # 明細(日付なし)ドリルダウン
+        if '明細(日付なし)' in pivot.columns:
+            with st.expander("🔍 明細(日付なし) 現場別内訳"):
+                ym_options = list(pivot[pivot['明細(日付なし)'] > 0].index)
+                if not ym_options:
+                    st.info("該当月はありません。")
+                else:
+                    sel_ym = st.selectbox("月を選択", ym_options, key=f"meisai_nd_ym_{id(costs_df)}")
+                    sel_year, sel_month = map(int, sel_ym.split('/'))
+                    ca = load_cost_allocations('kaikei')
+                    detail = ca[
+                        (ca['year'] == sel_year) &
+                        (ca['month'] == sel_month) &
+                        (ca['source'] == 'meisai_proportional')
+                    ][['genba_no', 'genba_name', 'hi_moku', 'amount_zeibetsu']].copy()
+                    detail = detail.sort_values('amount_zeibetsu', ascending=False)
+                    detail.columns = ['現場No', '現場名', '費目', '金額(税別)']
+                    st.dataframe(
+                        detail.style.format({'金額(税別)': '¥{:,.0f}'}),
+                        use_container_width=True, hide_index=True
+                    )
+                    st.caption(f"合計: ¥{detail['金額(税別)'].sum():,.0f} / {len(detail)}件")
+
     def render_pl_tab(df, costs_df, tab_key):
         if df.empty:
             st.info("この期間のデータはありません。")
